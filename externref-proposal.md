@@ -15,11 +15,12 @@ guaranteed to be valid for lifetime `'a`. These both have the ABI of
 
 It is a key requirement for us that it should be possible to call C functions
 that take and return `__externref_t` directly. For this reason, we define a
-`ByValue<_>` struct that can be used to wrap `Externref` and `ExternrefRef<'a>`.
-It marks the parameters and return values of `extern "C"` functions as
-representing `__externref_t` instead of `__externref_t*`. If any of the
-parameters or the return values have the `ByValue<_>` marker, the compiler emits
-wrappers to move values between table slots and the boundary.
+`ByValue<_>` struct that wraps `ExternrefRef<'a>` in parameter position and
+`Externref` in return position. It marks the parameters and return values of
+`extern "C"` functions as representing `__externref_t` instead of
+`__externref_t*`. If any of the parameters or the return values have the
+`ByValue<_>` marker, the compiler emits wrappers to move values between table
+slots and the boundary.
 
 The only place that we materialize a true `externref` is at the boundary of an
 `extern "C"` function when a parameter or return type is explicitly marked
@@ -30,9 +31,10 @@ The only place that we materialize a true `externref` is at the boundary of an
 There is an LLVM RFC to add support for pointer to externref. This adds a
 blessed table laid out with a bss section, a stack section, and a heap section.
 
-A pointer to externref is represented in LLVM IR as `ptr addrspace(2)`.
-Dereferencing a pointer to externref is lowered as a `table.get`. Assigning to
-one is lowered as a `table.set`.
+A pointer to externref is represented in LLVM IR as `ptr addrspace(2)`. (This
+is distinct from `addrspace(10)`, which LLVM already uses for `externref`
+values themselves.) Dereferencing a pointer to externref is lowered as a
+`table.get`. Assigning to one is lowered as a `table.set`.
 
 A pointer to externref can be allocated on the heap with
 `__externref_table_alloc()` and `__externref_table_free()`. They have the
@@ -46,7 +48,7 @@ following LLVM attributes:
     `allockind("free")` `allocsize(0)` `"alloc-family"="__externref_table"`
     `mustprogress` `nounwind` `willreturn` `memory(argmem: readwrite, inaccessiblemem: readwrite)`
 
-This are almost the same attributes as are present on `malloc` and `free`. These
+These are almost the same attributes as are present on `malloc` and `free`. These
 attributes allow a paired `__externref_table_alloc` and `__externref_table_free`
 to be optimized out.
 
@@ -83,7 +85,7 @@ unsafe extern "C" {
 
     fn __externref_assign(from: c_externref_ptr, to: c_externref_ptr);
     fn __externref_set_null(ptr: c_externref_ptr);
-    fn __externref_is_null(ptr: c_externref_ptr) -> bool;
+    fn __externref_is_null(ptr: c_externref_ptr) -> c_int;
 }
 ```
 
@@ -120,14 +122,20 @@ borrowed externref pointer that is valid for lifetime `'a`.
 The design is analogous to the `std::os::fd` safety types: `Externref`
 corresponds to `OwnedFd` and `ExternrefRef<'a>` corresponds to `BorrowedFd<'a>`.
 
-Both are `repr(transparent)` over `c_externref_ptr`. They are both assumed
-non-null so `0` is available as a niche. Because `c_externref_ptr` is
+Both are `repr(transparent)` over `c_externref_ptr`. The pointer they hold is
+never index `0`, so that index is available as a niche; this is independent of
+whether the slot's *contents* are `ref.null`. Because `c_externref_ptr` is
 `!Send + !Sync`, so are they.
 
-`Externref` and `ExternrefRef<_>` have interior mutibility. Because Rust does
+`Externref` and `ExternrefRef<_>` have interior mutability. Because Rust does
 not represent `__externref_t`, it is not possible for the pointer owned by an
 `ExternrefRef` to ever alias with a Rust reference. For this reason, the
-interior mutability poses no safety problems.
+interior mutability poses no safety problems. `!Sync` is load-bearing here:
+`table.set` is not atomic, so mutating a slot through a shared reference from
+two threads would be a data race.
+
+There is no `PartialEq`, `Hash`, or `Debug` for either type: Wasm has no
+equality instruction for `externref`, and no way to inspect one.
 
 #### Borrowed Externref Pointers
 
@@ -227,6 +235,17 @@ each position admits exactly one `T`: arguments must be
 parameter has type `ByValue<Externref>` or a return value has type
 `ByValue<ExternrefRef<'_>>` a compile error is emitted.
 
+The argument restriction exists for exports: a `ByValue<Externref>` parameter
+would require the export wrapper to heap-allocate a slot whose pointer escapes
+into the function body, which the default optimization pipeline cannot remove
+(see "Optimizing out allocations" below). With `ByValue<ExternrefRef<'_>>` the
+slot is a table-stack alloca and the body only pays for a heap slot when it
+explicitly calls `.to_owned()`.
+
+`ByValue<T>` is generic, rather than two position-specific types, so that the
+same marker and positional rule (borrowed in arguments, owned in returns)
+extend to other Wasm reference types in future without new lang items.
+
 ```rs
 // Trait bound to limit T to one of Externref or ExternrefRef
 pub trait ByValueRepr: AsExternref + sealed::Sealed {}
@@ -292,22 +311,14 @@ Only the `ByValue` parameter and the return are translated; `y` is already a
 pointer.
 
 Calls to `c_import` from Rust resolve to an implicit wrapper that loads the
-argument slot, allocates a slot for the return value, and stores into it. In
-pseudo code:
-
-```rs
-fn c_import(x: ByValue<ExternrefRef<'_>>, y: ExternrefRef<'_>) -> ByValue<Externref> {
-    let result = Externref::null();
-    unsafe { c_import_do_call(x.0.ptr, y.ptr, result.ptr) };
-    ByValue(result)
-}
-```
-
-with the C helper
+argument slot, allocates a slot for the return value, and stores into it. In C
+pseudo code, with `orig_c_import` being the real import:
 
 ```C
-void c_import_do_call(__externref_t* x, __externref_t* y, __externref_t* result) {
+__externref_t* c_import(__externref_t* x, __externref_t* y) {
+    __externref_t* result = __externref_table_alloc(1);
     *result = orig_c_import(*x, y);
+    return result;
 }
 ```
 
@@ -370,7 +381,7 @@ wrapped export.
 An `extern "C"` function pointer mentioning `ByValue<_>` always has the C
 by-value ABI.
 
-For isntance, a function `f` declared like
+For instance, a function `f` declared like
 ```rs
 extern "C" fn f(ByValue<ExternrefRef<'_>>) -> ByValue<Externref>
 ```
@@ -381,7 +392,9 @@ __externref_t f(__externref_t)
 Coercing `f` to a pointer type yields the address of the export wrapper. Calling
 through such a pointer from Rust goes through an import wrapper. This ensures
 that the pointer type has the same ABI whether the pointer came from Rust or
-from C.
+from C. A Rust-to-Rust call through such a pointer therefore passes through
+both wrappers, costing one slot allocation and free per `ByValue<Externref>`
+return that cannot be optimized across the indirect call.
 
 
 #### Structs
