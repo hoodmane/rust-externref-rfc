@@ -3,15 +3,18 @@
 We want to add externref support to Rust. Rust's operational semantics assume
 that any Rust value can be serialized to a "bag of bytes with provenance".
 However, a true `externref` value is an opaque reference to an object owned by
-the host garbage collector. Thus, adding a value that is represented in codegen
-by an externref violates the operational semantics of Rust. Instead, Rust will
-only handle pointers to `externref`.
+the host garbage collector. Thus, adding to Rust a type that is lowered to an
+externref violates the operational semantics of Rust. Instead, Rust will only
+handle pointers to `externref`.
 
-We define a type `Externref` which represents an owned externref pointer, and
-`ExternrefRef<'a>` which represents a borrowed externref pointer that is
-guaranteed to be valid for lifetime `'a`. These both have the ABI of
-`__externref_t*` when passed to/from `extern "C"` functions. (Or any other non
-"rust" ABI functions, I'm going to call them `extern "C"` functions throughout.)
+We define two new user-facing types:
+* `Externref` which represents an owned externref pointer, and
+* `ExternrefRef<'a>` which represents a borrowed externref pointer that is
+   guaranteed to be valid for lifetime `'a`.
+
+These both have the ABI of `__externref_t*` when passed to/from `extern "C"`
+functions. (Or any other non "rust" ABI functions, I'm going to call them
+`extern "C"` functions throughout.)
 
 It is a key requirement for us that it should be possible to call C functions
 that take and return `__externref_t` directly. For this reason, we define a
@@ -19,7 +22,7 @@ that take and return `__externref_t` directly. For this reason, we define a
 It marks the parameters and return values of `extern "C"` functions as
 representing `__externref_t` instead of `__externref_t*`. If any of the
 parameters or the return values have the `ByValue<_>` marker, the compiler emits
-wrappers to move values between table slots and the boundary.
+appropriate wrappers to adapt between `__externref_t*` and `__externref_t`.
 
 The only place that we materialize a true `externref` is at the boundary of an
 `extern "C"` function when a parameter or return type is explicitly marked
@@ -27,10 +30,13 @@ The only place that we materialize a true `externref` is at the boundary of an
 
 ## Dependency: LLVM RFC to add support for pointer to externref
 
-There is an LLVM RFC to add support for pointer to externref. This adds a
-blessed table laid out with a bss section, a stack section, and a heap section.
+There is an
+[LLVM RFC](https://discourse.llvm.org/t/rfc-webassembly-externref-t-pointers-in-clang-and-llvm/91914)
+to add support for pointer to externref, denoted `__externref_t*` in C.
+Here I summarize the relevant details of the LLVM proposal for this proposal.
 
-A pointer to externref is represented in LLVM IR as `ptr addrspace(2)`.
+A blessed table is laid out with a bss section, a stack section, and a heap
+section. A pointer to externref is represented in LLVM IR as `ptr addrspace(2)`.
 Dereferencing a pointer to externref is lowered as a `table.get`. Assigning to
 one is lowered as a `table.set`.
 
@@ -492,4 +498,23 @@ use(x);
 Only pointers that escape into a callee survive. For those, eliminating the
 allocation requires the `AAHeapToStack` pass, which runs only under the
 Attributor and is not in the default compilation pipeline. Using
-`with_stack_slot` manually ensures that no allocation occurs in these cases.
+`with_stack_slot` manually ensures that no allocation occurs in these cases. For
+example, here the pointer escapes:
+```C
+__externref_t* p = __externref_table_alloc(1);
+*p = x;
+use(p);
+__externref_table_free(p);
+```
+Ideally after optimizations the output would be the same as for the following:
+```C
+use(&x);
+```
+In order for this to happen, we must compile with the attributor and it must
+prove one of the following two conditions:
+1. `use()` never unwinds and never runs forever, or
+2. `use()` does not capture or free the pointer.
+
+Unfortunately, in order for `use()` to do anything useful with `p` it probably
+has to give it to a host function and the Attributor probably can't prove
+anything about what happens from there.
